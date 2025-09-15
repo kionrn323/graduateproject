@@ -1,262 +1,144 @@
-#!/usr/bin/env python3
-import os
-import json
-import shutil
-import threading
-import time
-import requests
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-from flask_socketio import SocketIO
-from blockchain import Blockchain, Block
-from transaction import Transaction
+console.log('▶️ app.js loaded');
 
-# ─── 경로 설정 ────────────────────────────────────────────────────────────
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE_DIR = os.path.join(BASE_DIR, 'templates')
-STATIC_DIR   = os.path.join(BASE_DIR, 'static')
+let userMap = {};
 
-CHAIN_FILE   = os.path.join(STATIC_DIR, 'chain_data.json')
-BACKUP_FILE  = os.path.join(STATIC_DIR, 'backup_chain.json')
-USERS_FILE   = os.path.join(BASE_DIR, 'users_data.json')
+document.addEventListener('DOMContentLoaded', () => {
+  bindAddUser();
+  loadUsers();
+  loadBlocked();
+  loadChain().then(initSocket).catch(console.error);
+});
 
-# ─── Flask 앱 초기화 ───────────────────────────────────────────────────────
-app = Flask(
-    __name__,
-    template_folder=TEMPLATE_DIR,
-    static_folder=STATIC_DIR,
-    static_url_path='/static'
-)
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-# ─── 블록체인, P2P, 메모리풀, 차단 UID 저장 ───────────────────────────────
-blockchain   = Blockchain(difficulty=2)
-NODES        = set()
-mempool      = []
-blocked_uids = set()
-
-# ─── 체인 저장/로드 ────────────────────────────────────────────────────────
-def save_chain_to_disk():
-    os.makedirs(STATIC_DIR, exist_ok=True)
-    with open(CHAIN_FILE, 'w', encoding='utf-8') as f:
-        json.dump([b.__dict__ for b in blockchain.chain], f, ensure_ascii=False, indent=2)
-    shutil.copy2(CHAIN_FILE, BACKUP_FILE)
-
-def load_chain_from_disk():
-    if os.path.exists(CHAIN_FILE) and os.path.getsize(CHAIN_FILE) > 0:
-        with open(CHAIN_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        blockchain.chain.clear()
-        for blk in data:
-            b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
-            b.nonce, b.hash = blk['nonce'], blk['hash']
-            blockchain.chain.append(b)
-    else:
-        blockchain.create_genesis_block()
-        save_chain_to_disk()
-
-# ─── P2P 노드 관리 ────────────────────────────────────────────────────────
-@app.route('/register_node', methods=['POST'])
-def register_node():
-    peers = request.json.get('nodes', [])
-    for p in peers:
-        NODES.add(p)
-    return jsonify({'all_nodes': list(NODES)}), 201
-
-# ─── 체인 조회 ─────────────────────────────────────────────────────────────
-@app.route('/chain', methods=['GET'])
-def get_chain():
-    return jsonify({
-        'length': len(blockchain.chain),
-        'chain':  [b.__dict__ for b in blockchain.chain]
-    }), 200
-
-# ─── 사용자 관리 ───────────────────────────────────────────────────────────
-@app.route('/api/users', methods=['GET', 'POST'])
-def users():
-    if request.method == 'GET':
-        try:
-            with open(USERS_FILE, 'r', encoding='utf-8') as f:
-                users = json.load(f)
-        except FileNotFoundError:
-            users = {}
-        return jsonify([{'uid': u, 'username': n} for u, n in users.items()])
-    # POST
-    body = request.json or {}
-    uid, name = body.get('uid'), body.get('username')
-    if not uid or not name:
-        return jsonify({'error': 'uid와 username 필요'}), 400
-    try:
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            users = json.load(f)
-    except FileNotFoundError:
-        users = {}
-    if uid in users:
-        return jsonify({'error': '이미 등록된 UID'}), 409
-    users[uid] = name
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
-    return jsonify([{'uid': u, 'username': n} for u, n in users.items()]), 201
-
-@app.route('/api/users/<uid>', methods=['DELETE'])
-def del_user(uid):
-    try:
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            users = json.load(f)
-    except FileNotFoundError:
-        users = {}
-    users.pop(uid, None)
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
-    return jsonify([{'uid': u, 'username': n} for u, n in users.items()]), 200
-
-# ─── 차단 목록 조회/해제 ────────────────────────────────────────────────────
-@app.route('/api/blocked', methods=['GET'])
-def get_blocked():
-    return jsonify(sorted(blocked_uids)), 200
-
-@app.route('/api/blocked/<uid>', methods=['DELETE'])
-def unblock_uid(uid):
-    blocked_uids.discard(uid)
-    return jsonify(sorted(blocked_uids)), 200
-
-# ─── 트랜잭션 수신 → 즉시 블록 생성 및 전파 ────────────────────────────────
-@app.route('/api/new_transaction', methods=['POST'])
-def new_transaction():
-    data = request.json or {}
-    if not all(k in data for k in ('uid', 'status', 'timestamp')):
-        return jsonify({'error': 'uid, status, timestamp 필요'}), 400
-
-    # 차단 상태라면 서버에도 기록
-    if data['status'] in ('blocked', '차단됨'):
-        blocked_uids.add(data['uid'])
-
-    # 현재 등록된 사용자 이름 가져오기
-    try:
-        users = json.load(open(USERS_FILE, 'r', encoding='utf-8'))
-        username = users.get(data['uid'])
-    except:
-        username = None
-
-    # 트랜잭션 데이터에 username 필드 추가
-    tx_dict = {
-        'uid':       data['uid'],
-        'status':    data['status'],
-        'timestamp': data['timestamp'],
-        'username':  username
+function bindAddUser() {
+  document.getElementById('addUser').onclick = async () => {
+    const uid = document.getElementById('uid').value.trim();
+    const username = document.getElementById('username').value.trim();
+    if (!uid || !username) return alert('UID와 이름을 모두 입력하세요.');
+    const res = await fetch('/api/users', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ uid, username })
+    });
+    if (res.ok) {
+      document.getElementById('uid').value = '';
+      document.getElementById('username').value = '';
+      loadUsers();
+    } else {
+      const err = await res.json();
+      alert(err.error || '등록 실패');
     }
+  };
+}
 
-    last = blockchain.last_block()
-    new_blk = Block(last.index + 1, data['timestamp'], tx_dict, last.hash)
-    proof = blockchain.proof_of_work(new_blk)
-    blockchain.add_block(new_blk, proof)
-    save_chain_to_disk()
+async function loadUsers() {
+  const list = await fetch('/api/users').then(r => r.json());
+  userMap = {};
+  const ul = document.getElementById('userList');
+  ul.innerHTML = '';
+  list.forEach(u => {
+    userMap[u.uid] = u.username;
+    const li = document.createElement('li');
+    li.innerHTML = `
+      <span>${u.uid} → ${u.username}</span>
+      <span class="delete-x" data-uid="${u.uid}">×</span>
+    `;
+    ul.appendChild(li);
+  });
+  document.querySelectorAll('.delete-x').forEach(x => {
+    x.onclick = async () => {
+      const uid = x.dataset.uid;
+      if (!confirm(`${uid} 사용자 삭제하시겠습니까?`)) return;
+      const res = await fetch(`/api/users/${uid}`, { method: 'DELETE' });
+      if (res.ok) loadUsers();
+      else alert('삭제 실패');
+    };
+  });
+}
 
-    # P2P 전파
-    for peer in NODES:
-        try:
-            requests.post(
-                f'http://{peer}/api/add_block',
-                json={'block': new_blk.__dict__, 'proof': proof},
-                timeout=2
-            )
-        except:
-            pass
+async function loadBlocked() {
+  const ul = document.getElementById('blockedList');
+  const arr = await fetch('/api/blocked').then(r => r.json());
+  if (arr.length === 0) {
+    ul.innerHTML = '<li>차단된 UID가 없습니다.</li>';
+    return;
+  }
+  ul.innerHTML = '';
+  arr.forEach(uid => {
+    const li = document.createElement('li');
+    li.innerHTML = `
+      <span>${uid}</span>
+      <span class="delete-x" data-uid="${uid}">×</span>
+    `;
+    ul.appendChild(li);
+  });
+  document.querySelectorAll('#blockedList .delete-x').forEach(x => {
+    x.onclick = async () => {
+      const uid = x.dataset.uid;
+      if (!confirm(`${uid} 차단 해제하시겠습니까?`)) return;
+      await fetch(`/api/blocked/${uid}`, { method: 'DELETE' });
+      loadBlocked();
+    };
+  });
+}
 
-    socketio.emit('new_block', {
-        'index':     new_blk.index,
-        'data':      new_blk.data,
-        'timestamp': new_blk.timestamp
-    })
-    return jsonify({'message': '블록 생성 완료'}), 201
+async function loadChain() {
+  ['chain-user','chain-open','chain-closed'].forEach(id =>
+    document.getElementById(id).innerHTML = ''
+  );
+  const data = await fetch('/chain').then(r => r.json());
+  data.chain.forEach(createBlock);
+}
 
-# ─── 피어로부터 블록 수신 ─────────────────────────────────────────────────
-@app.route('/api/add_block', methods=['POST'])
-def p2p_add_block():
-    data = request.json or {}
-    blk, proof = data.get('block'), data.get('proof')
-    if not blk or proof is None:
-        return jsonify({'error': 'block 및 proof 필요'}), 400
-    b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
-    b.nonce, b.hash = blk['nonce'], blk['hash']
-    if not blockchain.add_block(b, proof):
-        return jsonify({'message': 'rejected'}), 400
-    save_chain_to_disk()
-    socketio.emit('new_block', {
-        'index':     b.index,
-        'data':      b.data,
-        'timestamp': b.timestamp
-    })
-    return jsonify({'message': 'added'}), 201
+function initSocket() {
+  const socket = io();
+  socket.on('new_block', b => {
+    createBlock(b);
+    if (b.data.status === 'blocked' || b.data.status === '차단됨') {
+      loadBlocked();
+    }
+  });
+}
 
-# ─── 합의: 더 긴 체인으로 교체 ─────────────────────────────────────────────
-@app.route('/api/nodes/resolve', methods=['GET'])
-def consensus():
-    replaced, max_len, new_chain = False, len(blockchain.chain), None
-    for peer in NODES:
-        try:
-            r = requests.get(f'http://{peer}/chain', timeout=2).json()
-            length, chain_data = r['length'], r['chain']
-            if length > max_len and blockchain.is_chain_valid():
-                replaced, max_len, new_chain = True, length, chain_data
-        except:
-            pass
-    if replaced:
-        blockchain.chain.clear()
-        for blk in new_chain:
-            b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
-            b.nonce, b.hash = blk['nonce'], blk['hash']
-            blockchain.chain.append(b)
-        save_chain_to_disk()
-    return jsonify({
-        'replaced': replaced,
-        'chain':    [b.__dict__ for b in blockchain.chain]
-    }), 200
+function createBlock(b) {
+  let st = b.data.status;
+  const statusMap = { registered:'정상', unregistered:'미등록', blocked:'차단됨' };
+  if (statusMap[st]) st = statusMap[st];
 
-# ─── 루트: templates/index.html 제공 ───────────────────────────────────────
-@app.route('/')
-def index():
-    return send_from_directory(TEMPLATE_DIR, 'index.html')
+  // 블록에 저장된 username 우선, 없으면 userMap
+  const uname = b.data.username ?? (userMap[b.data.uid] || '-');
 
-# ─── 백그라운드 루프: 마이닝 & 합의 ───────────────────────────────────────
-def mine_loop():
-    while True:
-        if mempool:
-            txs = [tx for tx in mempool]
-            mempool.clear()
-            last = blockchain.last_block()
-            new_blk = Block(last.index + 1, time.time(), txs, last.hash)
-            proof = blockchain.proof_of_work(new_blk)
-            blockchain.add_block(new_blk, proof)
-            save_chain_to_disk()
-            for peer in NODES:
-                try:
-                    requests.post(
-                        f'http://{peer}/api/add_block',
-                        json={'block': new_blk.__dict__, 'proof': proof},
-                        timeout=2
-                    )
-                except:
-                    pass
-            socketio.emit('new_block', {
-                'index':     new_blk.index,
-                'data':      new_blk.data,
-                'timestamp': new_blk.timestamp
-            })
-        time.sleep(10)
+  let cid, cls, ico, title;
+  if (b.index === 0) {
+    cid='chain-user'; cls='block block-genesis'; ico='fa-cubes'; title='Genesis';
+  } else if (Array.isArray(b.data)) {
+    b.data.forEach(tx => createBlock({ index:b.index, data:tx, timestamp:tx.timestamp }));
+    return;
+  } else if (st==='open') {
+    cid='chain-open'; cls='block block-open'; ico='fa-door-open'; title='문 열림';
+  } else if (st==='closed') {
+    cid='chain-closed'; cls='block block-closed'; ico='fa-door-closed'; title='문 닫힘';
+  } else {
+    cid='chain-user';
+    if (st==='정상')      { cls='block block-normal'; ico='fa-check-circle'; title='정상'; }
+    else if (st==='미등록'){ cls='block block-unreg'; ico='fa-exclamation-triangle'; title='미등록'; }
+    else                  { cls='block block-blocked'; ico='fa-ban'; title='차단됨'; }
+  }
 
-def consensus_loop(port):
-    while True:
-        try:
-            requests.get(f'http://localhost:{port}/api/nodes/resolve', timeout=2)
-        except:
-            pass
-        time.sleep(10)
+  const ts = b.data.timestamp || b.timestamp;
+  const dt = new Date(ts*1000), ds = dt.toLocaleDateString(), tm = dt.toLocaleTimeString();
 
-if __name__ == '__main__':
-    load_chain_from_disk()
-    threading.Thread(target=mine_loop, daemon=True).start()
-    threading.Thread(target=consensus_loop, args=(5000,), daemon=True).start()
-    print("🌐 Server listening on 0.0.0.0:5000")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+  const el = document.createElement('div');
+  el.className = `${cls} new`;
+  el.innerHTML = `
+    <div class="block-header"><i class="fa-solid ${ico}"></i>${title} #${b.index}</div>
+    <div class="block-content">
+      <div class="label">UID:</div><div>${b.data.uid}</div>
+      <div class="label">이름:</div><div>${uname}</div>
+      <div class="label">상태:</div><div>${st}</div>
+      <div class="label">날짜:</div><div>${ds}</div>
+      <div class="label">시간:</div><div>${tm}</div>
+    </div>`;
+  document.getElementById(cid).appendChild(el);
+  document.getElementById(cid).scrollLeft = document.getElementById(cid).scrollWidth;
+  setTimeout(() => el.classList.remove('new'), 3000);
+}

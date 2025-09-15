@@ -1,0 +1,75 @@
+# tamper_chain.py
+#
+# mitmproxy 스크립트 – append-only 모드
+# • mitm_enabled=True 일 때만
+#   – 최신 블록 하나만 변조
+#   – 그 블록만 chain_data.json 끝에 추가(append)
+#   – payload.tampered=True 로 반환
+
+from mitmproxy import http, ctx
+import json, hashlib, os
+
+mitm_enabled    = False
+last_seen_index = -1
+
+def fake_hash(orig: str) -> str:
+    return hashlib.sha256((orig + "tamper").encode()).hexdigest()
+
+BASE       = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'static'))
+CHAIN_FILE = os.path.join(BASE, 'chain_data.json')
+
+ctx.log.info(f"[mitm] CHAIN_FILE = {CHAIN_FILE} (append-only)")
+
+def request(flow: http.HTTPFlow) -> None:
+    global mitm_enabled
+    if flow.request.path.endswith("/api/mitm/resume") and flow.request.method == "POST":
+        mitm_enabled = True
+        ctx.log.info("[mitm] MODE ON")
+    elif flow.request.path.endswith("/api/mitm/pause") and flow.request.method == "POST":
+        mitm_enabled = False
+        ctx.log.info("[mitm] MODE OFF")
+
+def response(flow: http.HTTPFlow) -> None:
+    global last_seen_index, mitm_enabled
+
+    # /chain 응답만 처리
+    if not flow.request.path.endswith("/chain"):
+        return
+
+    payload = json.loads(flow.response.content)
+    chain   = payload.get("chain", [])
+    if not chain or not mitm_enabled:
+        return  # MITM 꺼져 있거나 체인 비어 있으면 아무 작업 없이 반환
+
+    # 가장 최신 블록 찾기
+    last_block = max(chain, key=lambda b: b.get("index", -1))
+    idx = last_block.get("index", -1)
+    if idx <= last_seen_index:
+        ctx.log.info("[mitm] 변조할 새 블록 없음")
+        return
+
+    # 변조: username 뒤에 _MITM, hash 재계산
+    data = last_block.get("data", {})
+    if isinstance(data, dict) and data.get("username"):
+        data["username"] += "_MITM"
+    last_block["hash"] = fake_hash(last_block.get("hash", ""))
+
+    ctx.log.info(f"[mitm] 최신 블록 #{idx} 변조 완료")
+
+    # append-only 모드로 한 줄 추가
+    try:
+        os.makedirs(os.path.dirname(CHAIN_FILE), exist_ok=True)
+        with open(CHAIN_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(last_block, ensure_ascii=False) + "\n")
+        ctx.log.info(f"[mitm] chain_data.json에 블록 #{idx} append 성공")
+    except Exception as e:
+        ctx.log.error(f"[mitm] append 실패: {e}")
+
+    # last_seen_index 업데이트
+    last_seen_index = idx
+
+    # 클라이언트에 tampered 플래그와 전체 체인 반환
+    payload["tampered"] = True
+    payload["chain"]   = chain
+    flow.response.text = json.dumps(payload, ensure_ascii=False)
+    ctx.log.info("[mitm] 응답 변조 및 반환 완료")

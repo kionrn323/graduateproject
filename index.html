@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>실시간 블록체인 & 사용자 관리</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <link
+    href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="menu">
+    <h2>사용자 관리</h2>
+    <input
+      type="text"
+      id="uid"
+      name="uid"
+      placeholder="UID 입력"
+      autocomplete="username"
+    />
+    <input
+      type="text"
+      id="username"
+      name="username"
+      placeholder="이름 입력"
+      autocomplete="name"
+    />
+    <button id="addUser">등록</button>
+
+    <h3>등록된 사용자</h3>
+    <ul id="userList">로딩 중…</ul>
+
+    <h3>🚫 차단된 UID 목록</h3>
+    <ul id="blockedList">로딩 중…</ul>
+  </div>
+
+  <div id="main">
+    <h1>출입 기록</h1>
+    <div class="chain-section">
+      <h3>👤 사용자 태그</h3>
+      <div id="chain-user" class="chain-container"></div>
+    </div>
+    <div class="chain-section">
+      <h3>🔓 문 열림</h3>
+      <div id="chain-open" class="chain-container"></div>
+    </div>
+    <div class="chain-section">
+      <h3>🔒 문 닫힘</h3>
+      <div id="chain-closed" class="chain-container"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

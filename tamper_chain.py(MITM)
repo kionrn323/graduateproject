@@ -1,75 +1,83 @@
 # tamper_chain.py
-#
-# mitmproxy 스크립트 – append-only 모드
-# • mitm_enabled=True 일 때만
-#   – 최신 블록 하나만 변조
-#   – 그 블록만 chain_data.json 끝에 추가(append)
-#   – payload.tampered=True 로 반환
+from mitmproxy import http
+import json
+import os
+import hashlib
 
-from mitmproxy import http, ctx
-import json, hashlib, os
+# MITM 활성화 플래그 (초기값 ON)
+ENABLE_MITM = True
 
-mitm_enabled    = False
-last_seen_index = -1
+# 저장 경로
+BACKUP_PATH   = "backup_data.json"
+TAMPERED_PATH = "chain_data.json"
 
-def fake_hash(orig: str) -> str:
-    return hashlib.sha256((orig + "tamper").encode()).hexdigest()
-
-BASE       = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'static'))
-CHAIN_FILE = os.path.join(BASE, 'chain_data.json')
-
-ctx.log.info(f"[mitm] CHAIN_FILE = {CHAIN_FILE} (append-only)")
+def compute_hash(block: dict) -> str:
+    block_copy = {k: block[k] for k in block if k != "hash"}
+    block_str = json.dumps(block_copy, sort_keys=True).encode()
+    return hashlib.sha256(block_str).hexdigest()
 
 def request(flow: http.HTTPFlow) -> None:
-    global mitm_enabled
-    if flow.request.path.endswith("/api/mitm/resume") and flow.request.method == "POST":
-        mitm_enabled = True
-        ctx.log.info("[mitm] MODE ON")
-    elif flow.request.path.endswith("/api/mitm/pause") and flow.request.method == "POST":
-        mitm_enabled = False
-        ctx.log.info("[mitm] MODE OFF")
+    """
+    클라이언트가 /api/mitm/pause 또는 /api/mitm/resume
+    를 호출할 때 ENABLE_MITM 토글하고 바로 응답을 만들어줍니다.
+    """
+    global ENABLE_MITM
+
+    path = flow.request.path
+    if path.endswith("/api/mitm/pause"):
+        ENABLE_MITM = False
+        flow.response = http.HTTPResponse.make(
+            200,
+            json.dumps({"mitm_enabled": False}),
+            {"Content-Type": "application/json"}
+        )
+    elif path.endswith("/api/mitm/resume"):
+        ENABLE_MITM = True
+        flow.response = http.HTTPResponse.make(
+            200,
+            json.dumps({"mitm_enabled": True}),
+            {"Content-Type": "application/json"}
+        )
 
 def response(flow: http.HTTPFlow) -> None:
-    global last_seen_index, mitm_enabled
-
     # /chain 응답만 처리
     if not flow.request.path.endswith("/chain"):
         return
 
-    payload = json.loads(flow.response.content)
-    chain   = payload.get("chain", [])
-    if not chain or not mitm_enabled:
-        return  # MITM 꺼져 있거나 체인 비어 있으면 아무 작업 없이 반환
-
-    # 가장 최신 블록 찾기
-    last_block = max(chain, key=lambda b: b.get("index", -1))
-    idx = last_block.get("index", -1)
-    if idx <= last_seen_index:
-        ctx.log.info("[mitm] 변조할 새 블록 없음")
+    # ENABLE_MITM이 꺼져 있으면 아무 작업도 안 함
+    if not ENABLE_MITM:
         return
 
-    # 변조: username 뒤에 _MITM, hash 재계산
-    data = last_block.get("data", {})
-    if isinstance(data, dict) and data.get("username"):
-        data["username"] += "_MITM"
-    last_block["hash"] = fake_hash(last_block.get("hash", ""))
-
-    ctx.log.info(f"[mitm] 최신 블록 #{idx} 변조 완료")
-
-    # append-only 모드로 한 줄 추가
+    # JSON 파싱
     try:
-        os.makedirs(os.path.dirname(CHAIN_FILE), exist_ok=True)
-        with open(CHAIN_FILE, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(last_block, ensure_ascii=False) + "\n")
-        ctx.log.info(f"[mitm] chain_data.json에 블록 #{idx} append 성공")
-    except Exception as e:
-        ctx.log.error(f"[mitm] append 실패: {e}")
+        original = json.loads(flow.response.content)
+    except json.JSONDecodeError:
+        return
 
-    # last_seen_index 업데이트
-    last_seen_index = idx
+    # 서버에서 tampered 플래그가 false면 역시 무시
+    if not original.get("tampered", False):
+        return
 
-    # 클라이언트에 tampered 플래그와 전체 체인 반환
-    payload["tampered"] = True
-    payload["chain"]   = chain
-    flow.response.text = json.dumps(payload, ensure_ascii=False)
-    ctx.log.info("[mitm] 응답 변조 및 반환 완료")
+    # 1) 원본 백업
+    with open(BACKUP_PATH, "w", encoding="utf-8") as f:
+        json.dump(original, f, ensure_ascii=False, indent=2)
+
+    # 2) 깊은 복사 및 마지막 블록 변조
+    tampered = json.loads(json.dumps(original))
+    last_block = tampered["chain"][-1]
+    data = last_block.get("data")
+    if isinstance(data, dict):
+        # 안전하게 username에 _MITM 추가
+        data["username"] = (data.get("username") or "") + "_MITM"
+
+    # 3) 해시 재계산
+    last_block["hash"] = compute_hash(last_block)
+
+    # 4) 응답 본문 교체
+    flow.response.text = json.dumps(tampered)
+
+    # 5) 변조본 저장
+    with open(TAMPERED_PATH, "w", encoding="utf-8") as f:
+        json.dump(tampered, f, ensure_ascii=False, indent=2)
+
+    print(f"[MITM] chain response tampered and saved to {TAMPERED_PATH}")

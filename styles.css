@@ -1,0 +1,174 @@
+body {
+  display: flex;
+  margin: 0;
+  font-family: sans-serif;
+  height: 100vh;
+}
+
+/* 좌측 메뉴 */
+#menu {
+  width: 300px;
+  background: #343a40;
+  color: #fff;
+  padding: 1rem;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+#menu h2 {
+  margin-top: 0;
+  font-size: 1.6rem;
+}
+#menu h3 {
+  margin: 1rem 0 0.5rem;
+  font-size: 1.3rem;
+}
+#menu input,
+#menu button {
+  width: 100%;
+  margin: 0.5rem 0;
+  padding: 0.6rem;
+  box-sizing: border-box;
+  font-size: 1rem;
+}
+
+/* 리스트 */
+#userList,
+#blockedList,
+#suspendedList {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+#userList li,
+#blockedList li,
+#suspendedList li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #495057;
+  font-size: 1rem;
+}
+
+/* 삭제·해제 아이콘 */
+.delete-x {
+  cursor: pointer;
+  font-size: 1.4rem;
+  color: #bbb;
+  transition: color 0.2s;
+  margin-left: 0.5rem;
+}
+.delete-x:hover {
+  color: #ff6b6b;
+}
+
+/* 우측 메인 */
+#main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem;
+  background: #f1f3f5;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+#main h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+
+/* 체인 섹션 */
+.chain-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 1rem;
+}
+.chain-section h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.5rem;
+}
+
+/* 블록 컨테이너 */
+.chain-container {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  gap: 1rem;
+  padding-bottom: 0;
+}
+.chain-container::-webkit-scrollbar {
+  height: 6px;
+}
+.chain-container::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 3px;
+}
+
+/* 블록 카드 */
+.block {
+  flex: 0 0 auto;
+  width: 260px;
+  height: 100%;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  overflow: visible;
+  transition: transform 0.2s;
+  margin-bottom: 0;
+}
+.block:hover {
+  transform: translateY(-4px);
+}
+
+/* 블록 헤더 */
+.block-header {
+  display: flex;
+  align-items: center;
+  padding: 0.8rem 1rem;
+  color: #fff;
+  font-weight: bold;
+  font-size: 1.7rem;
+}
+/* 아이콘과 텍스트 사이 간격 추가 */
+.block-header i {
+  margin-right: 0.5rem;
+}
+
+.block-normal  .block-header { background: #198754; }
+.block-unreg   .block-header { background: #ffc107; }
+.block-blocked .block-header { background: #dc3545; }
+.block-genesis .block-header { background: #6c757d; }
+.block-open    .block-header { background: #0dcaf0; }
+.block-closed  .block-header { background: #fd7e14; }
+
+/* 블록 콘텐츠 */
+.block-content {
+  padding: 0.8rem 1rem;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  row-gap: 0.6rem;
+  column-gap: 0.8rem;
+  font-size: 1.3rem;
+  flex: 1;
+}
+.block-content .label {
+  font-weight: bold;
+}
+
+/* 새 블록 애니메이션 */
+.new {
+  animation: fadeIn 0.4s ease-out, pulseGlow 1.2s ease-in-out 1;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes pulseGlow {
+  0% { box-shadow: 0 0 0 0 rgba(255,255,0,0.7); }
+  50% { box-shadow: 0 0 10px 5px rgba(255,255,0,0); transform: scale(1.03); }
+ 100% { box-shadow: 0 0 0 0 rgba(255,255,0,0); transform: scale(1); }
+}

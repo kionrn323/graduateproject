@@ -1,16 +1,21 @@
+// app.js (A-node 웹 UI with MITM Toggle)
+
 // -------------------------------------
 // 스크립트 로드 확인
 // -------------------------------------
 console.log('▶️ A-node app.js loaded');
 
 let userMap = {};
+let allTampered = false;
 let maxRenderedIndex = -1;
 let firstLoad = true;
 let mitmEnabled = false;
 
 // -------------------------------------
-// 사용자 추가/삭제 바인딩
+// 함수 선언부
 // -------------------------------------
+
+// 사용자 추가/삭제 바인딩
 async function bindAddUser() {
   const btn = document.getElementById('addUser');
   if (!btn) return;
@@ -41,9 +46,7 @@ async function bindAddUser() {
   };
 }
 
-// -------------------------------------
 // 사용자 목록 로드
-// -------------------------------------
 async function loadUsers() {
   try {
     const list = await fetch('/api/users').then(r => r.json());
@@ -73,9 +76,7 @@ async function loadUsers() {
   }
 }
 
-// -------------------------------------
 // 차단 목록 로드
-// -------------------------------------
 async function loadBlocked() {
   try {
     const arr = await fetch('/api/blocked').then(r => r.json());
@@ -107,9 +108,7 @@ async function loadBlocked() {
   }
 }
 
-// -------------------------------------
 // 블록 카드 렌더링
-// -------------------------------------
 function createBlock(b) {
   let st = b.data.status;
   const statusMap = { registered: '정상', unregistered: '미등록', blocked: '차단됨' };
@@ -147,9 +146,7 @@ function createBlock(b) {
   setTimeout(() => el.classList.remove('new'), 3000);
 }
 
-// -------------------------------------
 // 화면 초기화
-// -------------------------------------
 function clearAllBlocks() {
   ['chain-user','chain-open','chain-closed'].forEach(id => {
     const e = document.getElementById(id);
@@ -157,31 +154,37 @@ function clearAllBlocks() {
   });
 }
 
-// -------------------------------------
-// 체인 업데이트 핸들러
-// -------------------------------------
-async function handleChainUpdate(chain, tampered) {
-  // 1) 전체 빨간 강조 토글
-  document.body.classList.toggle('tampered', tampered);
+// 자동 복구 + MITM 제어 + 전체 뷰 재렌더
+async function autoRecover() {
+  try {
+    console.log('⚙️ 변조 감지! 자동 복구 시작…');
 
-  // 2) 경광등 + 사이렌 제어
-  const light = document.getElementById('alarmLight');
-  const siren = document.getElementById('sirenAudio');
-  if (tampered) {
-    light.classList.remove('hidden');
-    // ★ siren.src 가 HTML에서 지정되어 있지 않다면 JS에서 지정
-    if (siren && !siren.src.includes('/static/siren.mp3')) {
-      siren.src = '/static/siren.mp3'; // ★ 수정됨
-    }
-    siren.currentTime = 0;
-    siren.play().catch(() => {});
-  } else {
-    light.classList.add('hidden');
-    siren.pause();
-    siren.currentTime = 0;
+    // 서버 복구
+    await fetch('/api/recover', { method: 'GET' });
+    console.log('✅ 복구 완료');
+
+    // MITM 일시정지
+    await fetch('/api/mitm/pause', { method: 'POST' });
+    console.log('🔒 MITM paused');
+
+    // 정상 체인 재조회
+    const { chain } = await fetch('/api/chain').then(r => r.json());
+    clearAllBlocks();
+    maxRenderedIndex = -1;
+    allTampered = false;
+    chain.forEach(createBlock);
+    await loadBlocked();
+  } catch (e) {
+    console.error('❌ 자동 복구 실패', e);
   }
+}
 
-  // 3) 블록 렌더링
+// 체인 업데이트 핸들러
+async function handleChainUpdate(chain, tampered) {
+  if (tampered) {
+    await autoRecover();
+    return;
+  }
   if (firstLoad) {
     clearAllBlocks();
     chain.forEach(createBlock);
@@ -192,30 +195,19 @@ async function handleChainUpdate(chain, tampered) {
       if (b.index > maxRenderedIndex) {
         createBlock(b);
         maxRenderedIndex = b.index;
-        if (['blocked','차단됨'].includes(b.data.status)) loadBlocked();
       }
     });
   }
 }
 
-// -------------------------------------
 // Socket.IO 실시간 처리
-// -------------------------------------
 function initSocket() {
   try {
-    // ★ 명시적으로 A-노드 서버로 연결하도록 변경됨
-    const socket = io('http://127.0.0.1:5006', {
-      transports: ['websocket'], // 웹소켓 전용
-      upgrade: false             // 폴링 방지
-    });
-
-    // 초기 체인 로드
+    const socket = io();
     fetch('/api/chain')
       .then(r => r.json())
       .then(data => handleChainUpdate(data.chain, data.tampered))
       .catch(e => console.error('초기 체인 로드 실패', e));
-
-    socket.on('connect', () => console.log('🔗 Socket.IO 연결 완료'));
     socket.on('chain_update', ({ chain, tampered }) =>
       handleChainUpdate(chain, tampered)
     );
@@ -231,42 +223,65 @@ function initSocket() {
   }
 }
 
-// -------------------------------------
-// MITM 토글 버튼 핸들러
-// -------------------------------------
+// MITM 토글 핸들러 (키보드 'm' 키로)
 async function toggleMitm() {
   try {
     const url = mitmEnabled ? '/api/mitm/pause' : '/api/mitm/resume';
     const resp = await fetch(url, { method: 'POST' });
-    const json = await resp.json();
+    const text = await resp.text();
     if (resp.ok) {
-      mitmEnabled = json.mitm_enabled;
-      const btn = document.getElementById('mitmToggle');
-      btn.textContent = `MITM 모드: ${mitmEnabled ? 'ON' : 'OFF'}`;
-      console.log(`🔄 MITM 토글 → ${mitmEnabled}`);
+      mitmEnabled = !mitmEnabled;
+      console.log(`🔄 MITM toggled via key → ${text}`);
     } else {
-      console.error('MITM 토글 실패', json);
-      alert('MITM 토글에 실패했습니다.');
+      console.error('MITM toggle failed', text);
     }
   } catch (err) {
-    console.error('MITM 토글 에러', err);
-    alert('통신 에러 발생');
+    console.error('Error toggling MITM', err);
   }
 }
 
-// -------------------------------------
+// 키보드 이벤트 리스너: 'm' 키로 MITM toggle
+document.addEventListener('keydown', event => {
+  if (event.key === 'm' && event.ctrlKey) { // Ctrl+M
+    toggleMitm();
+  }
+});
+
 // DOMContentLoaded 리스너
-// -------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
   bindAddUser();
   loadUsers();
   loadBlocked();
   initSocket();
 
-  // MITM 버튼 초기화
+  // 자동 resume on load
+  fetch('/api/mitm/resume', { method: 'POST' })
+    .then(r => r.text())
+    .then(text => {
+      mitmEnabled = true;
+      console.log(`✅ MITM resumed on load → ${text}`);
+    })
+    .catch(err => console.warn('MITM resume failed', err));
+});
+document.addEventListener('DOMContentLoaded', () => {
+  bindAddUser();
+  loadUsers();
+  loadBlocked();
+  initSocket();
+
+  // MITM 토글 버튼 초기화
   const mitmBtn = document.getElementById('mitmToggle');
   if (mitmBtn) {
     mitmBtn.textContent = `MITM 모드: OFF`;
     mitmBtn.onclick = toggleMitm;
+    // 페이지 로드 시 자동 resume
+    fetch('/api/mitm/resume', { method: 'POST' })
+      .then(r => r.text())
+      .then(text => {
+        mitmEnabled = true;
+        mitmBtn.textContent = `MITM 모드: ON`;
+        console.log(`✅ MITM resumed → ${text}`);
+      })
+      .catch(err => console.warn('MITM resume 실패', err));
   }
 });

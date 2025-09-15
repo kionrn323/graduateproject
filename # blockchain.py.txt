@@ -1,0 +1,56 @@
+# blockchain.py
+import json
+import hashlib
+
+class Block:
+    def __init__(self, index, timestamp, data, previous_hash, nonce=0):
+        self.index = index
+        self.timestamp = timestamp  # 문자열 또는 정수로 일관되게 사용
+        self.data = data
+        self.previous_hash = previous_hash
+        self.nonce = nonce
+        self.hash = self.compute_hash()
+
+    def compute_hash(self):
+        # 순서 고정된 JSON 직렬화로 해시 계산
+        block_dict = {
+            'index': self.index,
+            'timestamp': self.timestamp,
+            'data': self.data,
+            'previous_hash': self.previous_hash,
+            'nonce': self.nonce
+        }
+        block_string = json.dumps(block_dict, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+
+class Blockchain:
+    def __init__(self, difficulty=2):
+        self.difficulty = difficulty
+        self.chain = []
+        self.create_genesis_block()
+
+    def create_genesis_block(self):
+        genesis = Block(0, "1970-01-01T00:00:00", {'info': 'genesis'}, '0')
+        self.chain = [genesis]
+
+    def last_block(self):
+        return self.chain[-1]
+
+    def proof_of_work(self, block):
+        block.nonce = 0
+        computed_hash = block.compute_hash()
+        while not computed_hash.startswith('0' * self.difficulty):
+            block.nonce += 1
+            computed_hash = block.compute_hash()
+        return computed_hash
+
+    def add_block(self, block, proof):
+        if proof != block.compute_hash():
+            return False
+        if block.previous_hash != self.last_block().hash:
+            return False
+        block.hash = proof
+        self.chain.append(block)
+        return True
+

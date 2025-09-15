@@ -1,0 +1,214 @@
+# network.py
+
+import argparse
+import time
+import requests
+import json
+import os
+import shutil
+from flask import Flask, request, jsonify
+from blockchain import Blockchain, Block
+from transaction import Transaction
+from collections import deque
+import threading
+
+app = Flask(__name__)
+
+# — 체인 파일 경로 & P2P 블록체인 & 메모리풀 —
+CHAIN_FILE  = 'chain_data.json'
+BACKUP_FILE = 'backup_chain.json'
+blockchain  = Blockchain(difficulty=2)
+nodes       = set()       # register_node 로 관리되는 피어 주소 모음
+mempool     = deque()     # 블록에 포함되지 않은 트랜잭션 대기열
+
+def load_chain_from_disk():
+    """재시작 시 이전에 저장된 체인을 불러옵니다."""
+    if os.path.exists(CHAIN_FILE):
+        with open(CHAIN_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        blockchain.chain.clear()
+        for blk in data:
+            b = Block(
+                blk['index'],
+                blk['timestamp'],
+                blk['data'],
+                blk['previous_hash']
+            )
+            b.nonce, b.hash = blk['nonce'], blk['hash']
+            blockchain.chain.append(b)
+        print(f"✅ Loaded chain from {CHAIN_FILE}, length={len(blockchain.chain)}")
+    else:
+        print("⚠️ No existing chain file found; using fresh genesis block")
+
+def save_chain_to_disk():
+    """체인에 블록이 추가될 때마다 전체 체인을 디스크에 덤프하고 즉시 백업합니다."""
+    # 1) chain_data.json에 저장
+    with open(CHAIN_FILE, 'w', encoding='utf-8') as f:
+        json.dump([b.__dict__ for b in blockchain.chain],
+                  f, ensure_ascii=False, indent=2)
+    # 2) backup_chain.json으로 복사
+    shutil.copy2(CHAIN_FILE, BACKUP_FILE)
+    print(f"💾 Saved chain to {CHAIN_FILE} and backup to {BACKUP_FILE}, length={len(blockchain.chain)}")
+
+@app.route('/register_node', methods=['POST'])
+def register_node():
+    data = request.get_json()
+    peers = data.get('nodes')
+    if not peers:
+        return jsonify({'error': '등록할 노드 주소를 제공하세요.'}), 400
+    for peer in peers:
+        nodes.add(peer)
+    return jsonify({'message': '노드 등록 완료', 'all_nodes': list(nodes)}), 201
+
+@app.route('/chain', methods=['GET'])
+def get_chain():
+    chain_data = [{
+        'index': b.index,
+        'timestamp': b.timestamp,
+        'data': b.data,
+        'previous_hash': b.previous_hash,
+        'nonce': b.nonce,
+        'hash': b.hash
+    } for b in blockchain.chain]
+    return jsonify({'length': len(chain_data), 'chain': chain_data}), 200
+
+@app.route('/add_block', methods=['POST'])
+def add_block():
+    """
+    다른 노드에서 전파된 블록 수신
+    요청 형식: { 'block': {...}, 'proof': 'hash' }
+    """
+    # 항상 최신 디스크 체인 로드
+    load_chain_from_disk()
+
+    data  = request.get_json() or {}
+    blk   = data.get('block')
+    proof = data.get('proof')
+    if not blk or proof is None:
+        return jsonify({'error': 'block 및 proof를 보내주세요.'}), 400
+
+    # Block 객체로 복원
+    b = Block(
+        blk['index'],
+        blk['timestamp'],
+        blk['data'],
+        blk['previous_hash']
+    )
+    b.nonce, b.hash = blk['nonce'], blk['hash']
+
+    added = blockchain.add_block(b, proof)
+    if not added:
+        return jsonify({'message': '블록 수신 거부'}), 400
+
+    # 디스크에 저장 & 백업
+    save_chain_to_disk()
+    return jsonify({'message': '블록 추가 완료'}), 201
+
+@app.route('/new_transaction', methods=['POST'])
+def new_transaction():
+    """
+    센서나 외부에서 전송된 트랜잭션을 mempool에 저장하고,
+    등록된 모든 피어에게 재전파합니다.
+    """
+    data = request.get_json()
+    tx   = Transaction(data['uid'], data['door'], timestamp=data['timestamp'])
+    mempool.append(tx)
+
+    for peer in nodes:
+        try:
+            requests.post(
+                f'http://{peer}/new_transaction',
+                json=tx.to_dict(),
+                timeout=3
+            )
+        except requests.RequestException:
+            pass
+
+    return jsonify({
+        'message': 'Transaction added to mempool',
+        'mempool_size': len(mempool)
+    }), 201
+
+@app.route('/nodes/resolve', methods=['GET'])
+def consensus():
+    """
+    컨센서스 알고리즘: 가장 긴 체인을 찾아 교체합니다.
+    """
+    replaced = False
+    max_len  = len(blockchain.chain)
+    new_chain = None
+
+    for peer in nodes:
+        try:
+            res = requests.get(f'http://{peer}/chain', timeout=3).json()
+            length, chain_data = res['length'], res['chain']
+            if length > max_len and blockchain.is_chain_valid():
+                max_len, new_chain, replaced = length, chain_data, True
+        except requests.RequestException:
+            continue
+
+    if replaced and new_chain:
+        reconstructed = []
+        for blk in new_chain:
+            b = Block(
+                blk['index'],
+                blk['timestamp'],
+                blk['data'],
+                blk['previous_hash']
+            )
+            b.nonce, b.hash = blk['nonce'], blk['hash']
+            reconstructed.append(b)
+        blockchain.chain = reconstructed
+        save_chain_to_disk()
+
+    return jsonify({
+        'replaced': replaced,
+        'chain': [b.__dict__ for b in blockchain.chain]
+    }), 200
+
+def mine_loop():
+    """
+    10초마다 mempool 을 비워 블록으로 채굴합니다.
+    """
+    while True:
+        if mempool:
+            print(f"⏳ Mining start: mempool size = {len(mempool)}")
+            txs = [tx.to_dict() for tx in list(mempool)]
+            mempool.clear()
+
+            last = blockchain.last_block()
+            new_block = Block(
+                index=last.index + 1,
+                timestamp=time.time(),
+                data=txs,
+                previous_hash=last.hash
+            )
+            proof = blockchain.proof_of_work(new_block)
+            blockchain.add_block(new_block, proof)
+            print(f"⛏️  Mined block #{new_block.index} → {new_block.hash}")
+
+            for peer in nodes:
+                try:
+                    requests.post(
+                        f'http://{peer}/add_block',
+                        json={'block': new_block.__dict__, 'proof': proof},
+                        timeout=3
+                    )
+                except requests.RequestException:
+                    pass
+
+            save_chain_to_disk()
+            print(f"✅ Mining done: mempool size = {len(mempool)}")
+
+        time.sleep(10)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='P2P 네트워크 노드')
+    parser.add_argument('--port', type=int, default=5000, help='리스닝 포트')
+    args = parser.parse_args()
+
+    load_chain_from_disk()
+    threading.Thread(target=mine_loop, daemon=True).start()
+
+    print(f"🌐 Node listening on port {args.port} …")
+    app.run(host='0.0.0.0', port=args.port)

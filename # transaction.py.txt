@@ -1,0 +1,23 @@
+# transaction.py
+
+import time
+import json
+import hashlib
+
+class Transaction:
+    def __init__(self, uid, door, timestamp=None):
+        self.uid = uid
+        self.door = door             # 'open' / 'closed' / None(태그)
+        self.timestamp = timestamp or time.time()
+
+    def to_dict(self):
+        return {
+            'uid': self.uid,
+            'door': self.door,
+            'timestamp': self.timestamp
+        }
+
+    def hash(self):
+        """트랜잭션 고유 해시 (optional)"""
+        tx_json = json.dumps(self.to_dict(), sort_keys=True)
+        return hashlib.sha256(tx_json.encode()).hexdigest()

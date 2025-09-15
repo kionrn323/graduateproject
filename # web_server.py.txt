@@ -1,0 +1,274 @@
+import eventlet
+eventlet.monkey_patch()
+
+import os, json, threading, time, traceback, requests
+from flask import Flask, jsonify, render_template, request
+from flask_cors import CORS
+from flask_socketio import SocketIO
+from blockchain import Blockchain, Block
+
+app = Flask(
+    __name__,
+    static_folder='static',
+    template_folder='templates'
+)
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# — 파일 경로 설정 —
+CHAIN_FILE    = 'chain_data.json'
+BACKUP_FILE   = 'chain_backup.json'
+USERS_FILE    = 'users_data.json'
+
+# — 스레드 제어 플래그 — 
+sync_enabled = True  # False일 때는 A서버 동기화 중단
+
+# — 블록체인 초기화 & 백업 로드 —
+chain = Blockchain(difficulty=2)
+
+def load_chain_from_file():
+    if not os.path.exists(CHAIN_FILE):
+        return
+    with open(CHAIN_FILE, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    chain.chain.clear()
+    for blk in data:
+        b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
+        b.nonce, b.hash = blk['nonce'], blk['hash']
+        chain.chain.append(b)
+
+def load_backup_chain():
+    if not os.path.exists(BACKUP_FILE):
+        with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+    with open(BACKUP_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def update_backup_file():
+    arr = [{
+        'index': b.index,
+        'timestamp': b.timestamp,
+        'data': b.data,
+        'previous_hash': b.previous_hash,
+        'nonce': b.nonce,
+        'hash': b.hash
+    } for b in chain.chain]
+    with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
+        json.dump(arr, f, ensure_ascii=False, indent=2)
+
+# 최초 로드
+load_chain_from_file()
+backup_chain = load_backup_chain()
+
+# — 사용자 관리 —
+users = {}
+def load_users_from_disk():
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, 'r', encoding='utf-8') as f:
+                users.update(json.load(f))
+        except:
+            pass
+
+def save_users_to_disk():
+    with open(USERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+load_users_from_disk()
+
+# — 동기화 설정 —
+PEER_NODE     = '172.20.10.8:5000'
+SYNC_INTERVAL = 1  # 초
+
+# 전역 watch_mtime (sync_chain 과 watch_chain_file 공유)
+watch_mtime = os.path.getmtime(CHAIN_FILE) if os.path.exists(CHAIN_FILE) else 0
+
+def sync_chain():
+    """ A서버에서 static/chain_data.json을 주기 동기화 """
+    global watch_mtime
+    last_len = len(chain.chain)
+    while True:
+        time.sleep(SYNC_INTERVAL)
+        if not sync_enabled:
+            continue
+        try:
+            res = requests.get(f"http://{PEER_NODE}/static/chain_data.json", timeout=2)
+            res.raise_for_status()
+            remote_chain = res.json()
+            # 1) 파일 덮어쓰기
+            with open(CHAIN_FILE, 'w', encoding='utf-8') as f:
+                json.dump(remote_chain, f, ensure_ascii=False, indent=2)
+            # 2) 메모리 갱신
+            chain.chain.clear()
+            for blk in remote_chain:
+                b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
+                b.nonce, b.hash = blk['nonce'], blk['hash']
+                chain.chain.append(b)
+            # 3) 백업 갱신
+            update_backup_file()
+            # 4) 변경된 파일은 watch에서 무시
+            watch_mtime = os.path.getmtime(CHAIN_FILE)
+            # 5) 새 블록 푸시
+            if len(chain.chain) > last_len:
+                new_blk = chain.chain[-1]
+                socketio.emit('new_block', {
+                    'index':     new_blk.index,
+                    'data':      new_blk.data,
+                    'timestamp': new_blk.timestamp
+                })
+                last_len = len(chain.chain)
+        except Exception as e:
+            print(f"[SYNC ERROR] {e}")
+            continue
+
+def watch_chain_file():
+    """ 파일 시스템 변경을 감시, 변조 검사 """
+    global watch_mtime
+    while True:
+        time.sleep(1)
+        if not os.path.exists(CHAIN_FILE):
+            continue
+        mtime = os.path.getmtime(CHAIN_FILE)
+        if mtime == watch_mtime:
+            continue
+        watch_mtime = mtime  # 이 시점부터 진짜 변경
+        with open(CHAIN_FILE, 'r', encoding='utf-8') as f:
+            current = json.load(f)
+        backup = load_backup_chain()
+        # ─ 새 블록 추가된 경우는 정상 처리 ─
+        if len(current) > len(backup):
+            chain.chain.clear()
+            for blk in current:
+                b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
+                b.nonce, b.hash = blk['nonce'], blk['hash']
+                chain.chain.append(b)
+            update_backup_file()
+            socketio.emit('tamper_cleared', {})
+            continue
+        # ─ 그 외에만 변조 검사 ─
+        chain.chain.clear()
+        for blk in current:
+            b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
+            b.nonce, b.hash = blk['nonce'], blk['hash']
+            chain.chain.append(b)
+        diffs = []
+        limit = min(len(current), len(backup))
+        for i in range(limit):
+            orig, cur = backup[i], current[i]
+            idx = orig['index']
+            if cur.get('data') != orig.get('data'):
+                diffs.append({'index': idx, 'field': 'data', 'original': orig['data'], 'modified': cur['data']})
+            if isinstance(orig['data'], dict) and isinstance(cur['data'], dict):
+                for k in ('username','door'):
+                    if orig['data'].get(k) != cur['data'].get(k):
+                        diffs.append({'index': idx, 'field': k,
+                                      'original': orig['data'].get(k),
+                                      'modified': cur['data'].get(k)})
+            b = chain.chain[i]
+            if b.compute_hash() != b.hash:
+                diffs.append({'index': idx, 'field': 'hash',
+                              'original': b.compute_hash(), 'modified': b.hash})
+        if diffs:
+            print("[TAMPER DETECTED]", diffs)
+            socketio.emit('tamper_detected', {'diffs': diffs})
+        else:
+            socketio.emit('tamper_cleared', {})
+
+# ───────────── API 엔드포인트 ─────────────
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/toggle_sync', methods=['POST'])
+def toggle_sync():
+    """ sync_chain on/off 토글 """
+    global sync_enabled
+    sync_enabled = not sync_enabled
+    return jsonify({'sync_enabled': sync_enabled})
+
+@app.route('/api/tamper', methods=['POST'])
+def tamper_block():
+    """
+    테스트용: 로컬 chain_data.json 을 직접 수정합니다.
+    JSON body:
+      { "index":int, "field":str, "new_value":any }
+    """
+    payload = request.get_json() or {}
+    idx       = payload.get('index')
+    field     = payload.get('field')
+    new_value = payload.get('new_value')
+
+    # 1) 파일 로드
+    with open(CHAIN_FILE, 'r', encoding='utf-8') as f:
+        chain_data = json.load(f)
+
+    # 2) 변조
+    for blk in chain_data:
+        if blk.get('index') == idx:
+            if field in ('username','door') and isinstance(blk.get('data'), dict):
+                blk['data'][field] = new_value
+            else:
+                blk[field] = new_value
+            break
+
+    # 3) 덮어쓰기
+    with open(CHAIN_FILE, 'w', encoding='utf-8') as f:
+        json.dump(chain_data, f, ensure_ascii=False, indent=2)
+
+    return jsonify({'tampered': True}), 200
+
+@app.route('/api/chain')
+def api_chain():
+    load_chain_from_file()
+    return jsonify({'chain': [{
+        'index': b.index, 'timestamp': b.timestamp, 'data': b.data,
+        'previous_hash': b.previous_hash, 'nonce': b.nonce, 'hash': b.hash
+    } for b in chain.chain]})
+
+@app.route('/api/users', methods=['GET'])
+def get_users():
+    return jsonify([{'uid': u, 'username': nm} for u, nm in users.items()])
+
+@app.route('/api/users', methods=['POST'])
+def add_user():
+    data = request.get_json() or {}
+    uid, name = data.get('uid'), data.get('username')
+    if not uid or not name:
+        return jsonify({'error': 'uid와 username을 모두 보내주세요.'}), 400
+    if uid in users:
+        return jsonify({'error': '이미 등록된 UID입니다.'}), 409
+    users[uid] = name; save_users_to_disk()
+    return jsonify([{'uid': u, 'username': nm} for u, nm in users.items()]), 201
+
+@app.route('/api/users/<uid>', methods=['DELETE'])
+def del_user(uid):
+    users.pop(uid, None); save_users_to_disk()
+    return jsonify([{'uid': u, 'username': nm} for u, nm in users.items()]), 200
+
+@app.route('/api/recover', methods=['POST'])
+def recover_chain():
+    global watch_mtime
+    with open(CHAIN_FILE, 'r', encoding='utf-8') as f:
+        current = json.load(f)
+    backup = load_backup_chain()
+    extras = current[len(backup):]
+    new_chain = backup + extras
+    with open(CHAIN_FILE, 'w', encoding='utf-8') as f:
+        json.dump(new_chain, f, ensure_ascii=False, indent=2)
+    load_chain_from_file()
+    watch_mtime = os.path.getmtime(CHAIN_FILE)
+    update_backup_file()
+    socketio.emit('recovery_complete', {})
+    socketio.emit('tamper_cleared', {})
+    return jsonify(success=True), 200
+
+@socketio.on('connect')
+def handle_connect():
+    print("👉 UI connected")
+
+if __name__ == '__main__':
+    threading.Thread(target=sync_chain, daemon=True).start()
+    threading.Thread(target=watch_chain_file, daemon=True).start()
+    print("🚀 Server starting on port 8000 …")
+    socketio.run(app, host='0.0.0.0', port=8000)

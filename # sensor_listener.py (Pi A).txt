@@ -1,0 +1,205 @@
+# sensor_listener.py (Pi A)
+import os
+import json
+import shutil
+import time
+import requests
+import RPi.GPIO as GPIO
+from mfrc522 import SimpleMFRC522
+from blockchain import Block, Blockchain
+
+# RPLCD를 이용한 I2C LCD 라이브러리
+from RPLCD.i2c import CharLCD
+
+# — 앱 기본 경로 & static 폴더 설정 —
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
+if not os.path.exists(STATIC_DIR):
+    os.makedirs(STATIC_DIR)
+
+# — 체인 파일 경로 (static 아래) —
+CHAIN_FILE  = os.path.join(STATIC_DIR, 'chain_data.json')
+BACKUP_FILE = os.path.join(STATIC_DIR, 'backup_chain.json')
+
+# 하드웨어 설정
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+READER     = SimpleMFRC522()
+PIN_DOOR   = 18      # BCM 18 (Physical 12)
+SERVO_PIN  = 17      # BCM 17
+# Pi B Flask API endpoint for user list
+USER_API   = "http://172.20.10.9:8000/api/users"
+
+GPIO.setup(PIN_DOOR, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+servo = GPIO.PWM(SERVO_PIN, 50)
+servo.start(0)
+
+# — LCD 초기화 (I2C address는 실제 환경에 맞춰 조정) —
+lcd = CharLCD('PCF8574', address=0x27, port=1, cols=16, rows=2)
+
+def clear_and_print(line1, line2=''):
+    """Clear the display and print two lines of text"""
+    lcd.clear()
+    lcd.write_string(line1.ljust(16)[:16])
+    if line2:
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string(line2.ljust(16)[:16])
+
+# Pi B의 API에서 사용자 정보 읽기
+def get_user_info(uid):
+    """Fetch user info dict by UID from Pi B's API"""
+    try:
+        resp = requests.get(USER_API, timeout=2)
+        if resp.status_code != 200:
+            print(f"⚠️ Failed to fetch user data, HTTP status {resp.status_code}")
+            return None
+        users = resp.json()
+        for u in users:
+            if str(u.get('uid')) == uid:
+                return u
+    except json.JSONDecodeError as e:
+        print(f"⚠️ JSON decode error fetching user data: {e}")
+    except Exception as e:
+        print(f"⚠️ User data fetch error: {e}")
+    return None
+
+# 블록체인 초기화 및 디스크 로드
+def load_chain():
+    bchain = Blockchain(difficulty=2)
+    if os.path.exists(CHAIN_FILE):
+        with open(CHAIN_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        bchain.chain.clear()
+        for blk in data:
+            b = Block(blk['index'], blk['timestamp'], blk['data'], blk['previous_hash'])
+            b.nonce, b.hash = blk['nonce'], blk['hash']
+            bchain.chain.append(b)
+        print(f"✅ Loaded chain from {CHAIN_FILE} (length={len(bchain.chain)})")
+    else:
+        # 초기 genesis 저장
+        with open(CHAIN_FILE, 'w', encoding='utf-8') as f:
+            json.dump([b.__dict__ for b in bchain.chain], f, ensure_ascii=False, indent=2)
+        shutil.copy2(CHAIN_FILE, BACKUP_FILE)
+        print(f"💾 Initialized chain and backup with genesis block")
+    return bchain
+
+chain = load_chain()
+PEERS = ["172.20.10.8:5000", "172.20.10.9:5001"]
+
+# 체인 저장 및 백업 함수
+def save_and_backup_chain():
+    with open(CHAIN_FILE, 'w', encoding='utf-8') as f:
+        json.dump([b.__dict__ for b in chain.chain], f, ensure_ascii=False, indent=2)
+    shutil.copy2(CHAIN_FILE, BACKUP_FILE)
+    print(f"💾 Saved & backed up chain ({len(chain.chain)} blocks)")
+
+# P2P 블록 전파
+def broadcast_block(block, proof):
+    payload = {'block': block.__dict__, 'proof': proof}
+    for peer in PEERS:
+        try:
+            requests.post(f"http://{peer}/add_block", json=payload, timeout=3)
+        except:
+            pass
+
+# 서보 모터 제어
+def open_door():
+    servo.ChangeDutyCycle(7.5)
+    time.sleep(0.5)
+    servo.ChangeDutyCycle(0)
+
+def close_door():
+    servo.ChangeDutyCycle(2.5)
+    time.sleep(0.5)
+    servo.ChangeDutyCycle(0)
+
+# 블록 생성 및 전파
+def create_and_broadcast(data):
+    last = chain.last_block()
+    blk  = Block(
+        index=last.index + 1,
+        timestamp=time.time(),
+        data=data,
+        previous_hash=last.hash
+    )
+    proof = chain.proof_of_work(blk)
+    chain.add_block(blk, proof)
+    print(f"✅ Created block #{blk.index} → {blk.hash}")
+    broadcast_block(blk, proof)
+    save_and_backup_chain()
+
+# 메인 루프
+def main():
+    print("▶️ Sensor & Servo listener started (Ctrl+C to stop)")
+    try:
+        while True:
+            # 1) Wait for tag
+            clear_and_print('Please scan tag...', '')
+            print("Please scan tag...")
+
+            # 2) RFID 읽기
+            try:
+                uid, _ = READER.read()
+                print(f"📶 Tag read: UID={uid}")
+            except Exception as e:
+                print(f"⚠️ RFID read error: {e}")
+                time.sleep(1)
+                continue
+
+            uid_str = str(uid)
+            # 사용자 정보 조회 (이름 미표시)
+            get_user_info(uid_str)  # 호출만 해서 캐시하거나 로그 활용 가능
+
+            # 3) Tag block & LCD 표시 (UID만 표시)
+            clear_and_print(f'UID: {uid_str}', '')
+            data_user = {
+                'uid': uid_str,
+                'username': '',
+                'door': None,
+                'time': time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+            create_and_broadcast(data_user)
+
+            # 4) Door open
+            time.sleep(2)
+            open_door()
+            clear_and_print('Access Open', '')
+            while GPIO.input(PIN_DOOR) == GPIO.HIGH:
+                time.sleep(0.1)
+
+            data_open = {
+                'uid': uid_str,
+                'username': '',
+                'door': 'open',
+                'time': time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+            create_and_broadcast(data_open)
+
+            # 5) Door close
+            time.sleep(3)
+            close_door()
+            clear_and_print('Access Closed', '')
+            while GPIO.input(PIN_DOOR) == GPIO.LOW:
+                time.sleep(0.1)
+
+            data_closed = {
+                'uid': uid_str,
+                'username': '',
+                'door': 'closed',
+                'time': time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+            create_and_broadcast(data_closed)
+
+            # 6) Prompt for next scan
+            clear_and_print('Please scan tag...', '')
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n⏹️ Sensor & Servo listener stopped")
+    finally:
+        servo.stop()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
